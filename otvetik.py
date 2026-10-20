@@ -3,6 +3,7 @@
 import json
 from dataclasses import dataclass, field
 from threading import Thread
+from time import sleep
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
@@ -27,7 +28,7 @@ __id__ = "otvetik"
 __name__ = "Otvetik"
 __description__ = "Предлагает ответ в твоём стиле по последним 10+10 сообщениям"
 __author__ = "@nevermorelove"
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 __icon__ = "OtvetikPlugin/0"
 __sdk_version__ = ">=1.4.5.0"
 
@@ -35,6 +36,8 @@ PER_SPEAKER = 10
 PAGE_SIZE = 100
 MAX_PAGES = 10
 MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_GENERATION_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 2
 REASONING_EFFORTS = ("", "none", "minimal", "low", "medium", "high", "xhigh", "max")
 REPLY_STYLES = {
     "auto": (
@@ -537,6 +540,24 @@ class OtvetikPlugin(BasePlugin):
             job.offset = next_offset
             self._load_history(job)
 
+    def _request_reply(self, job, dialogue):
+        def notify_retry():
+            if self._active and self._job is job:
+                BulletinHelper.show_info("Модель занята. Повтор через 2 секунды.")
+
+        for attempt in range(MAX_GENERATION_ATTEMPTS):
+            if not self._active or self._job is not job:
+                return None
+            try:
+                return job.client.generate(dialogue)
+            except HTTPError as error:
+                error.close()
+                if error.code != 503 or attempt == MAX_GENERATION_ATTEMPTS - 1:
+                    raise
+                run_on_ui_thread(notify_retry)
+                sleep(RETRY_DELAY_SECONDS)
+        return None
+
     def _generate(self, job):
         dialogue = job.window.dialogue
         if not any(line["speaker"] == "peer" for line in dialogue):
@@ -552,15 +573,16 @@ class OtvetikPlugin(BasePlugin):
             if self._job is not job or not self._active:
                 return
             try:
-                reply = job.client.generate(dialogue)
+                reply = self._request_reply(job, dialogue)
             except HTTPError as error:
                 status = error.code
-                run_on_ui_thread(
-                    lambda: self._fail(
-                        job,
-                        f"Сервер ответил HTTP {status}. Проверь ключ, модель и Reasoning effort.",
-                    )
+                reason = (
+                    f"Сервер модели временно недоступен (HTTP 503). Не удалось получить "
+                    f"ответ за {MAX_GENERATION_ATTEMPTS} попытки. Повтори позже."
+                    if status == 503
+                    else f"Сервер ответил HTTP {status}. Проверь ключ, модель и Reasoning effort."
                 )
+                run_on_ui_thread(lambda: self._fail(job, reason))
             except (URLError, TimeoutError, OSError):
                 run_on_ui_thread(
                     lambda: self._fail(
@@ -575,7 +597,8 @@ class OtvetikPlugin(BasePlugin):
                     lambda: self._fail(job, "Не удалось получить ответ от модели.")
                 )
             else:
-                run_on_ui_thread(lambda: self._reply_ready(job, reply))
+                if reply is not None:
+                    run_on_ui_thread(lambda: self._reply_ready(job, reply))
 
         Thread(target=work, name="Otvetik", daemon=True).start()
 

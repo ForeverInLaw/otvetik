@@ -3,10 +3,12 @@ import json
 import sys
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from io import BytesIO
 from pathlib import Path
 from threading import Thread
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
+from urllib.error import HTTPError
 
 
 def load_plugin():
@@ -87,6 +89,16 @@ def history(messages):
     )
 
 
+def http_error(status):
+    return HTTPError(
+        "https://example.com/v1/chat/completions",
+        status,
+        "Service unavailable",
+        {},
+        BytesIO(b'{"error": "Model at capacity test-secret"}'),
+    )
+
+
 class ContextTests(unittest.TestCase):
     def test_each_speaker_gets_ten_across_pages_in_chronological_order(self):
         window = plugin.ContextWindow()
@@ -146,6 +158,14 @@ class ClientTests(unittest.TestCase):
                     self.send_response(302)
                     self.send_header("Location", "/destination")
                     self.end_headers()
+                elif (
+                    self.path.startswith("/capacity/")
+                    and sum(path.startswith("/capacity/") for path, _, _ in captured)
+                    < 3
+                ):
+                    self.send_response(503)
+                    self.end_headers()
+                    self.wfile.write(b'{"error": "Model at capacity"}')
                 else:
                     self.reply()
 
@@ -210,6 +230,16 @@ class ClientTests(unittest.TestCase):
                 self.assertIn(instruction, system)
                 self.assertIn("Не выдумывай личные факты", system)
                 self.assertNotIn("{style}", system)
+            instance = plugin.OtvetikPlugin()
+            instance._active = True
+            client = plugin.ChatClient(base + "/capacity", "model", "test-key")
+            job = plugin.Generation(1, 42, 500, client)
+            instance._job = job
+            with patch.object(plugin, "sleep") as pause:
+                self.assertEqual(instance._request_reply(job, dialogue), "давай")
+            self.assertEqual(pause.call_args_list, [call(2), call(2)])
+            attempts = captured[-3:]
+            self.assertTrue(all(item == attempts[0] for item in attempts))
             plugin.ChatClient(base + "/redirect", "model", "secret").generate(dialogue)
             self.assertEqual(captured[-1][0], "/destination")
             self.assertNotIn("Authorization", captured[-1][1])
@@ -290,6 +320,76 @@ class FlowTests(unittest.TestCase):
         plugin.BulletinHelper.reset_mock()
         plugin.AlertDialogBuilder.reset_mock(return_value=True)
         plugin.send_request.reset_mock(side_effect=True)
+
+    def generate_now(self):
+        with patch.object(
+            plugin,
+            "Thread",
+            side_effect=lambda **kw: SimpleNamespace(start=kw["target"]),
+        ):
+            self.instance._generate(self.job)
+
+    def test_capacity_response_retries_every_two_seconds_then_inserts_once(self):
+        self.job.window.add_page([message(500)])
+        errors = [http_error(503), http_error(503)]
+        self.job.client.generate.side_effect = [*errors, "Ответ готов"]
+        with patch.object(plugin, "sleep", create=True) as pause:
+            self.generate_now()
+        self.assertEqual(self.job.client.generate.call_count, 3)
+        self.assertEqual(pause.call_args_list, [call(2), call(2)])
+        self.editor.setFieldText.assert_called_once_with("Ответ готов")
+        self.assertTrue(all(error.fp.closed for error in errors))
+        self.assertIsNone(self.instance._job)
+
+    def test_capacity_retries_stop_after_three_attempts_without_exposing_body(self):
+        self.job.window.add_page([message(500)])
+        errors = [http_error(503) for _ in range(3)]
+        self.job.client.generate.side_effect = errors
+        with patch.object(plugin, "sleep", create=True) as pause:
+            self.generate_now()
+        self.assertEqual(self.job.client.generate.call_count, 3)
+        self.assertEqual(pause.call_args_list, [call(2), call(2)])
+        self.editor.setFieldText.assert_not_called()
+        notice = str(plugin.BulletinHelper.show_error.call_args)
+        self.assertIn("503", notice)
+        self.assertNotIn("test-secret", notice)
+        self.assertNotIn("Reasoning effort", notice)
+        self.assertTrue(all(error.fp.closed for error in errors))
+        self.assertIsNone(self.instance._job)
+
+    def test_other_http_errors_are_not_retried(self):
+        self.job.window.add_page([message(500)])
+        for status in (400, 401, 403, 429, 500):
+            with self.subTest(status=status):
+                self.instance._job = self.job
+                self.job.client.generate.reset_mock()
+                error = http_error(status)
+                self.job.client.generate.side_effect = error
+                with patch.object(plugin, "sleep", create=True) as pause:
+                    self.generate_now()
+                self.job.client.generate.assert_called_once()
+                pause.assert_not_called()
+                self.editor.setFieldText.assert_not_called()
+                self.assertNotIn(
+                    "test-secret", str(plugin.BulletinHelper.show_error.call_args)
+                )
+                self.assertTrue(error.fp.closed)
+                self.assertIsNone(self.instance._job)
+
+    def test_unload_during_retry_delay_prevents_another_request(self):
+        self.job.window.add_page([message(500)])
+        self.job.client.generate.side_effect = [http_error(503), "Late reply"]
+        with patch.object(
+            plugin,
+            "sleep",
+            create=True,
+            side_effect=lambda seconds: self.instance.on_plugin_unload(),
+        ) as pause:
+            self.generate_now()
+        pause.assert_called_once_with(2)
+        self.job.client.generate.assert_called_once()
+        self.editor.setFieldText.assert_not_called()
+        self.assertIsNone(self.instance._job)
 
     def test_history_uses_explicit_account_and_selected_message_boundary(self):
         self.instance._load_history(self.job)
