@@ -61,12 +61,23 @@ def load_plugin():
 plugin = load_plugin()
 
 
-def message(number, *, out=False, text=None, forwarded=False):
+def message(number, *, out=False, text=None, forwarded=False, grouped_id=0):
     return SimpleNamespace(
         id=number,
         out=out,
         message=str(number) if text is None else text,
         fwd_from=object() if forwarded else None,
+        grouped_id=grouped_id,
+    )
+
+
+def menu_message(number, *, dialog=42, **kwargs):
+    raw = message(number, **kwargs)
+    return SimpleNamespace(
+        messageOwner=raw,
+        getId=lambda: number,
+        getDialogId=lambda: dialog,
+        isOutOwner=lambda: raw.out,
     )
 
 
@@ -431,6 +442,77 @@ class FlowTests(unittest.TestCase):
         )
         plugin.send_request.assert_not_called()
         self.assertIsNone(self.instance._job)
+
+    def test_any_album_item_resolves_its_caption_before_generating(self):
+        for caption_id in (490, 510):
+            with self.subTest(caption_id=caption_id):
+                self.instance._job = None
+                self.editor.setFieldText.reset_mock()
+                client = Mock()
+                client.generate.return_value = "Ответ на пост"
+                selected = menu_message(500, text="", forwarded=True, grouped_id=7)
+                caption = menu_message(
+                    caption_id, text="Подпись всего поста", forwarded=True, grouped_id=7
+                )
+                group = SimpleNamespace(
+                    findCaptionMessageObject=Mock(return_value=caption)
+                )
+                context = SimpleNamespace(
+                    get={
+                        "account": 1,
+                        "message": selected,
+                        "groupedMessages": group,
+                    }.get
+                )
+                with (
+                    patch.object(plugin, "ChatClient", return_value=client),
+                    patch.object(
+                        plugin,
+                        "Thread",
+                        side_effect=lambda **kw: SimpleNamespace(start=kw["target"]),
+                    ),
+                ):
+                    self.instance._start(context)
+                    self.assertIsNotNone(self.instance._job)
+                    self.assertEqual(self.instance._job.anchor_id, caption_id)
+                    request, callback = plugin.send_request.call_args.args
+                    self.assertEqual(request.max_id, caption_id + 1)
+                    callback(history([]), None)
+                client.generate.assert_called_once_with(
+                    [
+                        {
+                            "speaker": "peer",
+                            "text": "Подпись всего поста",
+                            "forwarded": True,
+                        }
+                    ]
+                )
+                self.editor.setFieldText.assert_called_once_with("Ответ на пост")
+
+    def test_album_caption_must_belong_to_the_same_incoming_post(self):
+        selected = menu_message(500, text="", forwarded=True, grouped_id=7)
+        for caption in (
+            None,
+            menu_message(490, grouped_id=8),
+            menu_message(490, grouped_id=7, dialog=43),
+            menu_message(490, grouped_id=7, out=True),
+        ):
+            with self.subTest(caption=caption):
+                self.instance._job = None
+                group = SimpleNamespace(
+                    findCaptionMessageObject=Mock(return_value=caption)
+                )
+                self.instance._start(
+                    SimpleNamespace(
+                        get={
+                            "account": 1,
+                            "message": selected,
+                            "groupedMessages": group,
+                        }.get
+                    )
+                )
+                plugin.send_request.assert_not_called()
+                self.assertIsNone(self.instance._job)
 
     def test_style_selection_is_saved_for_the_original_chat_and_account(self):
         saved = {}

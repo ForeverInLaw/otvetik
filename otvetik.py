@@ -27,7 +27,7 @@ __id__ = "otvetik"
 __name__ = "Otvetik"
 __description__ = "Предлагает ответ в твоём стиле по последним 10+10 сообщениям"
 __author__ = "@nevermorelove"
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 __icon__ = "OtvetikPlugin/0"
 __sdk_version__ = ">=1.4.5.0"
 
@@ -431,6 +431,23 @@ class OtvetikPlugin(BasePlugin):
         if message is None or message.isOutOwner() or message.getDialogId() <= 0:
             BulletinHelper.show_info("Выбери входящее сообщение в личном диалоге.")
             return
+        if not str(message.messageOwner.message or "").strip():
+            group = context.get("groupedMessages")
+            if group is not None and int(message.messageOwner.grouped_id) != 0:
+                try:
+                    # Telegram stores an album's shared caption on one item only.
+                    caption = group.findCaptionMessageObject()
+                    if (
+                        caption is not None
+                        and not caption.isOutOwner()
+                        and caption.getDialogId() == message.getDialogId()
+                        and int(caption.messageOwner.grouped_id)
+                        == int(message.messageOwner.grouped_id)
+                    ):
+                        message = caption
+                except Exception:  # noqa: BLE001 -- Native SDK boundary; no private data.
+                    BulletinHelper.show_error("Не удалось прочитать подпись альбома.")
+                    return
         if not str(message.messageOwner.message or "").strip():
             BulletinHelper.show_info("Выбери сообщение с текстом или подписью.")
             return
