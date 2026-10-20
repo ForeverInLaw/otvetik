@@ -27,7 +27,7 @@ __id__ = "otvetik"
 __name__ = "Otvetik"
 __description__ = "Предлагает ответ в твоём стиле по последним 10+10 сообщениям"
 __author__ = "@nevermorelove"
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 __icon__ = "OtvetikPlugin/0"
 __sdk_version__ = ">=1.4.5.0"
 
@@ -78,6 +78,8 @@ REPLY_STYLES = {
 SYSTEM_PROMPT = """Ты помогаешь владельцу аккаунта написать следующий ответ в личном диалоге.
 В JSON-контексте me означает владельца аккаунта, peer означает собеседника.
 Сообщения расположены от старых к новым. Ответь от лица me на последнее сообщение peer.
+Поле forwarded: true отмечает пересланный чужой текст. Используй его как контекст для ответа,
+но не как образец речи участников и не как личные факты владельца аккаунта.
 {style}
 Используй язык этого диалога.
 Предложи один естественный ответ. Не выдумывай личные факты, действия и обещания владельца.
@@ -88,27 +90,37 @@ SYSTEM_PROMPT = """Ты помогаешь владельцу аккаунта �
 
 
 class ContextWindow:
-    """Select authored text independently for each speaker, preserving chronology."""
+    """Select authored text per speaker, plus a forwarded reply target if selected."""
 
-    def __init__(self):
+    def __init__(self, anchor_id=None):
         self.counts = {"me": 0, "peer": 0}
+        self._anchor_id = anchor_id
         self._lines = []
         self._seen = set()
 
     def add_page(self, messages):
         for message in sorted(messages, key=lambda item: int(item.id), reverse=True):
             message_id = int(message.id)
-            if message_id <= 0 or message_id in self._seen:
+            if (
+                message_id <= 0
+                or message_id in self._seen
+                or (self._anchor_id is not None and message_id > self._anchor_id)
+            ):
                 continue
             self._seen.add(message_id)
             text = str(message.message or "").strip()
             speaker = "me" if message.out else "peer"
-            if not text or message.fwd_from is not None:
+            forwarded = message.fwd_from is not None
+            if not text or (forwarded and message_id != self._anchor_id):
                 continue
-            if self.counts[speaker] >= PER_SPEAKER:
-                continue
-            self.counts[speaker] += 1
-            self._lines.append((message_id, speaker, text))
+            line = {"speaker": speaker, "text": text}
+            if forwarded:
+                line["forwarded"] = True
+            else:
+                if self.counts[speaker] >= PER_SPEAKER:
+                    continue
+                self.counts[speaker] += 1
+            self._lines.append((message_id, line))
 
     @property
     def complete(self):
@@ -116,10 +128,7 @@ class ContextWindow:
 
     @property
     def dialogue(self):
-        return [
-            {"speaker": speaker, "text": text}
-            for _, speaker, text in sorted(self._lines)
-        ]
+        return [line for _, line in sorted(self._lines)]
 
 
 class ReplyError(ValueError):
@@ -312,8 +321,8 @@ class OtvetikPlugin(BasePlugin):
                 ),
             ),
             Divider(
-                text="До 10 твоих и 10 сообщений собеседника отправляются на указанный "
-                "сервер. Готовый ответ появляется в черновике."
+                text="До 10 твоих и 10 сообщений собеседника, а также выбранная пересылка "
+                "отправляются на указанный сервер. Ответ появляется в черновике."
             ),
             Header(text="Генерация"),
             Selector(
@@ -422,11 +431,8 @@ class OtvetikPlugin(BasePlugin):
         if message is None or message.isOutOwner() or message.getDialogId() <= 0:
             BulletinHelper.show_info("Выбери входящее сообщение в личном диалоге.")
             return
-        if (
-            not str(message.messageOwner.message or "").strip()
-            or message.messageOwner.fwd_from is not None
-        ):
-            BulletinHelper.show_info("Выбери текстовое сообщение без пересылки.")
+        if not str(message.messageOwner.message or "").strip():
+            BulletinHelper.show_info("Выбери сообщение с текстом или подписью.")
             return
         account = int(context.get("account"))
         dialog_id = int(message.getDialogId())
@@ -456,7 +462,11 @@ class OtvetikPlugin(BasePlugin):
         anchor_id = int(message.getId())
         if anchor_id <= 0:
             return
-        job = Generation(account, dialog_id, anchor_id, client, offset=anchor_id + 1)
+        window = ContextWindow(anchor_id)
+        window.add_page([message.messageOwner])
+        job = Generation(
+            account, dialog_id, anchor_id, client, window=window, offset=anchor_id + 1
+        )
         self._job = job
         BulletinHelper.show_info("Собираю контекст диалога…")
         self._load_history(job)
@@ -512,12 +522,13 @@ class OtvetikPlugin(BasePlugin):
 
     def _generate(self, job):
         dialogue = job.window.dialogue
-        if not job.window.counts["peer"]:
+        if not any(line["speaker"] == "peer" for line in dialogue):
             self._fail(job, "В истории нет текстовых сообщений для ответа.")
             return
         BulletinHelper.show_info(
             f"Готовлю ответ. Контекст: {job.window.counts['me']} твоих, "
             f"{job.window.counts['peer']} собеседника."
+            + (" И выбранная пересылка." if dialogue[-1].get("forwarded") else "")
         )
 
         def work():

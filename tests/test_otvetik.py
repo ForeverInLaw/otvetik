@@ -97,6 +97,31 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(window.dialogue, [{"speaker": "peer", "text": "3"}])
         self.assertFalse(window.complete)
 
+    def test_forwarded_target_is_extra_context_without_reducing_authored_samples(self):
+        window = plugin.ContextWindow(50)
+        target = message(50, text="Пересланный текст", forwarded=True)
+        window.add_page([target])
+        window.add_page(
+            [
+                message(51, text="Новее выбранного"),
+                target,
+                message(49, out=True, forwarded=True),
+                message(48, forwarded=True),
+                *[message(i, out=i > 15) for i in range(1, 31)],
+            ]
+        )
+        self.assertTrue(window.complete)
+        self.assertEqual(window.counts, {"me": 10, "peer": 10})
+        self.assertEqual(len(window.dialogue), 21)
+        self.assertEqual(
+            [int(line["text"]) for line in window.dialogue[:-1]],
+            list(range(6, 16)) + list(range(21, 31)),
+        )
+        self.assertEqual(
+            window.dialogue[-1],
+            {"speaker": "peer", "text": "Пересланный текст", "forwarded": True},
+        )
+
 
 class ClientTests(unittest.TestCase):
     def test_real_http_request_and_redirect_do_not_leak_authorization(self):
@@ -135,7 +160,14 @@ class ClientTests(unittest.TestCase):
         thread.start()
         try:
             base = f"http://127.0.0.1:{server.server_port}"
-            dialogue = [{"speaker": "peer", "text": "Пойдём?"}]
+            window = plugin.ContextWindow(2)
+            window.add_page(
+                [
+                    message(1, out=True, text="Моя манера речи"),
+                    message(2, text="Пересланный вопрос", forwarded=True),
+                ]
+            )
+            dialogue = window.dialogue
             for path in ("/v1/", "/v1/chat/completions"):
                 client = plugin.ChatClient(base + path, "my-model", "test-key")
                 self.assertEqual(client.generate(dialogue), "давай")
@@ -148,6 +180,10 @@ class ClientTests(unittest.TestCase):
                 )
                 self.assertNotIn("test-key", json.dumps(body))
                 self.assertNotIn("reasoning_effort", body)
+                system = body["messages"][0]["content"]
+                self.assertIn("forwarded: true", system)
+                self.assertIn("не как образец речи", system)
+                self.assertNotIn("Пересланный вопрос", system)
             for effort in plugin.REASONING_EFFORTS[1:]:
                 client = plugin.ChatClient(
                     base + "/v1", "my-model", "test-key", reasoning_effort=effort
@@ -351,6 +387,50 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(self.instance._job.client.reasoning_effort, "high")
         self.assertEqual(self.instance._job.client.reply_style, "strict")
         self.instance._load_history.assert_called_once_with(self.instance._job)
+
+    def test_forwarded_target_generates_a_draft_without_authored_peer_history(self):
+        self.instance._job = None
+        client = Mock()
+        client.generate.return_value = "Ответ на пересылку"
+        incoming = SimpleNamespace(
+            isOutOwner=lambda: False,
+            getDialogId=lambda: 42,
+            getId=lambda: 500,
+            messageOwner=message(500, text="  Пересланная подпись  ", forwarded=True),
+        )
+        with (
+            patch.object(plugin, "ChatClient", return_value=client),
+            patch.object(
+                plugin,
+                "Thread",
+                side_effect=lambda **kw: SimpleNamespace(start=kw["target"]),
+            ),
+        ):
+            self.instance._start(
+                SimpleNamespace(get={"account": 1, "message": incoming}.get)
+            )
+            job = self.instance._job
+            self.assertEqual(job.window.counts, {"me": 0, "peer": 0})
+            callback = plugin.send_request.call_args.args[1]
+            callback(history([]), None)
+        client.generate.assert_called_once_with(
+            [{"speaker": "peer", "text": "Пересланная подпись", "forwarded": True}]
+        )
+        self.editor.setFieldText.assert_called_once_with("Ответ на пересылку")
+        self.assertIsNone(self.instance._job)
+
+    def test_forward_without_text_or_caption_does_not_start_generation(self):
+        self.instance._job = None
+        incoming = SimpleNamespace(
+            isOutOwner=lambda: False,
+            getDialogId=lambda: 42,
+            messageOwner=message(500, text="  ", forwarded=True),
+        )
+        self.instance._start(
+            SimpleNamespace(get={"account": 1, "message": incoming}.get)
+        )
+        plugin.send_request.assert_not_called()
+        self.assertIsNone(self.instance._job)
 
     def test_style_selection_is_saved_for_the_original_chat_and_account(self):
         saved = {}
