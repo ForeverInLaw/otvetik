@@ -41,7 +41,7 @@ def load_plugin():
         "ui.bulletin": {"BulletinHelper": Mock()},
         "ui.settings": {
             name: (lambda **kwargs: SimpleNamespace(**kwargs))
-            for name in ("Divider", "Header", "Text")
+            for name in ("Divider", "Header", "Selector", "Text")
         },
     }
     modules = {}
@@ -147,6 +147,13 @@ class ClientTests(unittest.TestCase):
                     json.loads(body["messages"][1]["content"]), {"dialogue": dialogue}
                 )
                 self.assertNotIn("test-key", json.dumps(body))
+                self.assertNotIn("reasoning_effort", body)
+            for effort in plugin.REASONING_EFFORTS[1:]:
+                client = plugin.ChatClient(
+                    base + "/v1", "my-model", "test-key", reasoning_effort=effort
+                )
+                self.assertEqual(client.generate(dialogue), "давай")
+                self.assertEqual(captured[-1][2]["reasoning_effort"], effort)
             plugin.ChatClient(base + "/redirect", "model", "secret").generate(dialogue)
             self.assertEqual(captured[-1][0], "/destination")
             self.assertNotIn("Authorization", captured[-1][1])
@@ -171,6 +178,14 @@ class ClientTests(unittest.TestCase):
                     self.assertRaises(plugin.ReplyError),
                 ):
                     plugin.ChatClient(*settings)
+            network.assert_not_called()
+
+    def test_invalid_effort_never_reaches_the_network(self):
+        with patch.object(plugin, "urlopen") as network:
+            with self.assertRaises(plugin.ReplyError):
+                plugin.ChatClient(
+                    "https://example.com/v1", "model", "key", reasoning_effort="unknown"
+                )
             network.assert_not_called()
 
     def test_malformed_empty_and_oversized_responses_are_safe_errors(self):
@@ -293,6 +308,30 @@ class FlowTests(unittest.TestCase):
         settings = self.instance.create_settings()
         self.assertEqual(settings[3].subtext, "Добавлен")
         self.assertNotIn("test-secret", str(settings))
+
+    def test_selected_effort_reaches_generation_client(self):
+        self.instance._job = None
+        settings = {
+            "base_url": "https://example.com/v1",
+            "model": "model",
+            "api_key": "test-key",
+            "reasoning_effort": plugin.REASONING_EFFORTS.index("high"),
+        }
+        self.instance.get_setting.side_effect = lambda key, default="": settings.get(
+            key, default
+        )
+        self.instance._load_history = Mock()
+        incoming = SimpleNamespace(
+            isOutOwner=lambda: False,
+            getDialogId=lambda: 42,
+            getId=lambda: 500,
+            messageOwner=message(500),
+        )
+        self.instance._start(
+            SimpleNamespace(get={"account": 1, "message": incoming}.get)
+        )
+        self.assertEqual(self.instance._job.client.reasoning_effort, "high")
+        self.instance._load_history.assert_called_once_with(self.instance._job)
 
     def test_unexpected_transport_error_does_not_reveal_credentials(self):
         self.job.window.add_page([message(500)])

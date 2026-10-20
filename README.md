@@ -37,6 +37,11 @@
 Выбирай модель с поддержкой Chat Completions и системных инструкций.
 Глазик в диалоге API-ключа показывает и скрывает введённое значение.
 
+В разделе **Генерация** можно выбрать **Reasoning effort**: `none`, `minimal`, `low`, `medium`, `high`, `xhigh` или `max`.
+При выборе **По умолчанию** плагин не передаёт этот параметр и использует настройки сервера.
+Выбранный уровень отправляется как `reasoning_effort`. Поддержка уровней зависит от модели и провайдера.
+Формат описан в [официальной документации OpenAI](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create).
+
 ## Как получить ответ
 
 1. Открой личный диалог.
@@ -85,7 +90,7 @@ Android API в тестах заменён заглушками. Для пров
 
 GitHub Actions запускает проверки для `main`, pull request и тегов `v*`.
 После успешной проверки тега публикует GitHub Release с файлом `otvetik.plugin`.
-Тег должен совпадать с `__version__` в `otvetik.py`, например `v1.0.2`.
+Тег должен совпадать с `__version__` в `otvetik.py`, например `v1.1.0`.
 
 Документация: [Plugins SDK](https://plugins.exteragram.app/docs), [Telegram messages.getHistory](https://core.telegram.org/method/messages.getHistory).
 

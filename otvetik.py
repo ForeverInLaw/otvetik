@@ -21,13 +21,13 @@ from org.telegram.ui.ActionBar import Theme
 from org.telegram.ui.Components import EditTextBoldCursor
 from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
-from ui.settings import Divider, Header, Text
+from ui.settings import Divider, Header, Selector, Text
 
 __id__ = "otvetik"
 __name__ = "Otvetik"
 __description__ = "Предлагает ответ в твоём стиле по последним 10+10 сообщениям"
 __author__ = "@nevermorelove"
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 __icon__ = "OtvetikPlugin/0"
 __sdk_version__ = ">=1.4.5.0"
 
@@ -35,6 +35,7 @@ PER_SPEAKER = 10
 PAGE_SIZE = 100
 MAX_PAGES = 10
 MAX_RESPONSE_BYTES = 1024 * 1024
+REASONING_EFFORTS = ("", "none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 SYSTEM_PROMPT = """Ты помогаешь владельцу аккаунта написать следующий ответ в личном диалоге.
 В JSON-контексте me означает владельца аккаунта, peer означает собеседника.
@@ -90,9 +91,12 @@ class ReplyError(ValueError):
 class ChatClient:
     """Small OpenAI-compatible Chat Completions boundary, with no SDK dependency."""
 
-    def __init__(self, base_url, model, api_key):
+    def __init__(self, base_url, model, api_key, *, reasoning_effort=""):
         self.model = model.strip()
         self._api_key = api_key.strip()
+        if reasoning_effort not in REASONING_EFFORTS:
+            raise ReplyError("Выбери Reasoning effort в настройках Otvetik.")
+        self.reasoning_effort = reasoning_effort
         if not base_url.strip() or not self.model or not self._api_key:
             raise ReplyError(
                 "Заполни Base URL, модель и API-ключ в настройках Otvetik."
@@ -125,6 +129,8 @@ class ChatClient:
                 },
             ],
         }
+        if self.reasoning_effort:
+            body["reasoning_effort"] = self.reasoning_effort
         request = Request(
             self._endpoint,
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -215,6 +221,14 @@ class OtvetikPlugin(BasePlugin):
                 text="До 10 твоих и 10 сообщений собеседника отправляются на указанный "
                 "сервер. Готовый ответ появляется в черновике."
             ),
+            Header(text="Генерация"),
+            Selector(
+                key="reasoning_effort",
+                text="Reasoning effort",
+                default=0,
+                items=["По умолчанию", *REASONING_EFFORTS[1:]],
+            ),
+            Divider(text="Доступные уровни зависят от модели и сервера."),
         ]
 
     def _edit_setting(self, title, key, hint, *, secret=False):
@@ -328,10 +342,16 @@ class OtvetikPlugin(BasePlugin):
             )
             return
         try:
+            effort_index = self.get_setting("reasoning_effort", 0)
+            if not isinstance(effort_index, int) or not 0 <= effort_index < len(
+                REASONING_EFFORTS
+            ):
+                raise ReplyError("Выбери Reasoning effort в настройках Otvetik.")
             client = ChatClient(
                 str(self.get_setting("base_url", "")),
                 str(self.get_setting("model", "")),
                 str(self.get_setting("api_key", "")),
+                reasoning_effort=REASONING_EFFORTS[effort_index],
             )
         except ReplyError as error:
             BulletinHelper.show_error(str(error))
@@ -412,7 +432,8 @@ class OtvetikPlugin(BasePlugin):
                 status = error.code
                 run_on_ui_thread(
                     lambda: self._fail(
-                        job, f"Сервер ответил HTTP {status}. Проверь ключ и модель."
+                        job,
+                        f"Сервер ответил HTTP {status}. Проверь ключ, модель и Reasoning effort.",
                     )
                 )
             except (URLError, TimeoutError, OSError):
