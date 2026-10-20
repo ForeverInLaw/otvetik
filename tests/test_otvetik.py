@@ -32,7 +32,14 @@ def load_plugin():
             "get_messages_controller": Mock(),
             "send_request": Mock(),
         },
-        "org.telegram.messenger": {"AndroidUtilities": Mock()},
+        "org.telegram.messenger": {
+            "AndroidUtilities": Mock(),
+            "DialogObject": SimpleNamespace(
+                isEncryptedDialog=lambda dialog_id: (
+                    dialog_id > 0 and bool(dialog_id & 0x4000000000000000)
+                )
+            ),
+        },
         "org.telegram.tgnet": {
             "TLRPC": SimpleNamespace(TL_messages_getHistory=SimpleNamespace)
         },
@@ -63,13 +70,14 @@ def load_plugin():
 plugin = load_plugin()
 
 
-def message(number, *, out=False, text=None, forwarded=False, grouped_id=0):
+def message(number, *, out=False, text=None, forwarded=False, grouped_id=0, sender=7):
     return SimpleNamespace(
         id=number,
         out=out,
         message=str(number) if text is None else text,
         fwd_from=object() if forwarded else None,
         grouped_id=grouped_id,
+        from_id=SimpleNamespace(user_id=sender, chat_id=0, channel_id=0),
     )
 
 
@@ -85,7 +93,9 @@ def menu_message(number, *, dialog=42, **kwargs):
 
 def history(messages):
     return SimpleNamespace(
-        messages=SimpleNamespace(size=lambda: len(messages), get=messages.__getitem__)
+        messages=SimpleNamespace(size=lambda: len(messages), get=messages.__getitem__),
+        users=[],
+        chats=[],
     )
 
 
@@ -100,6 +110,54 @@ def http_error(status):
 
 
 class ContextTests(unittest.TestCase):
+    def test_named_group_context_ends_at_selected_message_with_ten_per_side(self):
+        controller = Mock()
+        names = {7: "Анна", 8: "Борис", 9: "Анна", 10: "me"}
+        controller.getUser.side_effect = lambda user_id: SimpleNamespace(
+            first_name=names[user_id]
+        )
+        window = plugin.ContextWindow(50, controller=controller, dialog_id=-42)
+        window.add_page([message(50, sender=7)])
+        window.add_page(
+            [message(i, out=i % 2 == 1, sender=7 + i % 4) for i in range(30, 61)]
+        )
+        self.assertEqual(window.counts, {"me": 10, "peer": 10})
+        self.assertTrue(window.complete)
+        self.assertEqual(
+            [int(line["text"]) for line in window.dialogue], list(range(31, 51))
+        )
+        self.assertEqual(window.dialogue[-1], {"speaker": "Анна", "text": "50"})
+        self.assertIn("Анна (2)", [line["speaker"] for line in window.dialogue])
+        self.assertEqual(sum(line["speaker"] == "me" for line in window.dialogue), 10)
+        self.assertNotIn("peer", [line["speaker"] for line in window.dialogue])
+
+    def test_names_resolve_after_history_users_arrive_and_reserve_me(self):
+        controller = Mock()
+        controller.getUser.return_value = None
+        window = plugin.ContextWindow(50, controller=controller, dialog_id=42)
+        window.add_page([message(50, sender=10), message(49, out=True)])
+        controller.getUser.return_value = SimpleNamespace(first_name="me")
+        self.assertEqual(
+            window.dialogue,
+            [{"speaker": "me", "text": "49"}, {"speaker": "me (2)", "text": "50"}],
+        )
+
+    def test_unknown_sender_and_anonymous_group_author_have_safe_names(self):
+        controller = Mock()
+        controller.getUser.return_value = None
+        controller.getChat.return_value = SimpleNamespace(title="Группа")
+        anonymous = message(49, sender=0)
+        anonymous.from_id.channel_id = 42
+        window = plugin.ContextWindow(50, controller=controller, dialog_id=-42)
+        window.add_page([message(50), anonymous])
+        self.assertEqual(
+            window.dialogue,
+            [
+                {"speaker": "Группа", "text": "49"},
+                {"speaker": "Участник", "text": "50"},
+            ],
+        )
+
     def test_each_speaker_gets_ten_across_pages_in_chronological_order(self):
         window = plugin.ContextWindow()
         window.add_page([message(i, out=True) for i in range(11, 31)])
@@ -301,6 +359,9 @@ class ClientTests(unittest.TestCase):
 
 class FlowTests(unittest.TestCase):
     def setUp(self):
+        plugin.get_messages_controller.return_value.getUser.return_value = (
+            SimpleNamespace(first_name="Анна")
+        )
         self.instance = plugin.OtvetikPlugin()
         self.instance.add_menu_item = Mock()
         self.instance.get_setting = Mock(side_effect=lambda key, default="": default)
@@ -328,6 +389,83 @@ class FlowTests(unittest.TestCase):
             side_effect=lambda **kw: SimpleNamespace(start=kw["target"]),
         ):
             self.instance._generate(self.job)
+
+    def test_group_reply_loads_selected_boundary_and_inserts_named_draft(self):
+        for megagroup in (False, True):
+            with self.subTest(megagroup=megagroup):
+                self.instance._job = None
+                self.editor.setFieldText.reset_mock()
+                self.fragment.getDialogId = lambda: -42
+                controller = plugin.get_messages_controller.return_value
+                controller.getChat.return_value = SimpleNamespace(
+                    broadcast=False, megagroup=megagroup
+                )
+                client = Mock()
+                client.generate.return_value = "Ответ группе"
+                with (
+                    patch.object(plugin, "ChatClient", return_value=client),
+                    patch.object(
+                        plugin,
+                        "Thread",
+                        side_effect=lambda **kw: SimpleNamespace(start=kw["target"]),
+                    ),
+                ):
+                    self.instance._start(
+                        SimpleNamespace(
+                            get={
+                                "account": 1,
+                                "message": menu_message(500, dialog=-42),
+                            }.get
+                        )
+                    )
+                    request, callback = plugin.send_request.call_args.args
+                    self.assertEqual(request.max_id, 501)
+                    controller.getInputPeer.assert_called_with(-42)
+                    callback(history([message(501, text="Позже выбранного")]), None)
+                client.generate.assert_called_once_with(
+                    [{"speaker": "Анна", "text": "500"}]
+                )
+                self.editor.setFieldText.assert_called_once_with("Ответ группе")
+
+    def test_channels_and_secret_chats_do_not_start_generation(self):
+        plugin.get_messages_controller.return_value.getChat.return_value = (
+            SimpleNamespace(broadcast=True, megagroup=False)
+        )
+        for dialog_id in (-42, 0x400000000000002A):
+            with self.subTest(dialog_id=dialog_id):
+                self.instance._job = None
+                self.instance._start(
+                    SimpleNamespace(
+                        get={
+                            "account": 1,
+                            "message": menu_message(500, dialog=dialog_id),
+                        }.get
+                    )
+                )
+                plugin.send_request.assert_not_called()
+                self.assertIsNone(self.instance._job)
+
+    def test_sender_lookup_failure_releases_busy_state_without_exposing_data(self):
+        controller = Mock()
+        controller.getUser.side_effect = RuntimeError("private-user-data")
+        self.job.window = plugin.ContextWindow(500, controller=controller)
+        self.job.window.add_page([message(500)])
+        self.instance._generate(self.job)
+        self.assertIsNone(self.instance._job)
+        self.job.client.generate.assert_not_called()
+        self.assertNotIn(
+            "private-user-data", str(plugin.BulletinHelper.show_error.call_args)
+        )
+
+    def test_group_style_is_saved_for_group_and_account(self):
+        self.fragment.getDialogId = lambda: -42
+        plugin.get_messages_controller.return_value.getChat.return_value = (
+            SimpleNamespace(broadcast=False, megagroup=True)
+        )
+        self.instance._show_style_dialog()
+        dialog = plugin.AlertDialogBuilder.return_value
+        dialog.set_items.call_args.args[1](dialog, 1)
+        self.instance.set_setting.assert_called_once_with("reply_style_1_-42", "meme")
 
     def test_capacity_response_retries_every_two_seconds_then_inserts_once(self):
         self.job.window.add_page([message(500)])
@@ -525,7 +663,7 @@ class FlowTests(unittest.TestCase):
             callback = plugin.send_request.call_args.args[1]
             callback(history([]), None)
         client.generate.assert_called_once_with(
-            [{"speaker": "peer", "text": "Пересланная подпись", "forwarded": True}]
+            [{"speaker": "Анна", "text": "Пересланная подпись", "forwarded": True}]
         )
         self.editor.setFieldText.assert_called_once_with("Ответ на пересылку")
         self.assertIsNone(self.instance._job)
@@ -581,7 +719,7 @@ class FlowTests(unittest.TestCase):
                 client.generate.assert_called_once_with(
                     [
                         {
-                            "speaker": "peer",
+                            "speaker": "Анна",
                             "text": "Подпись всего поста",
                             "forwarded": True,
                         }

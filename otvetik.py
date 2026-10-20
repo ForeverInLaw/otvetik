@@ -1,4 +1,4 @@
-"""Draft replies from the last ten authored messages on each side of a dialogue."""
+"""Draft replies from ten owner and ten incoming messages up to the selected target."""
 
 import json
 from dataclasses import dataclass, field
@@ -15,7 +15,7 @@ from android.widget import ImageView, LinearLayout
 from android_utils import OnClickListener, run_on_ui_thread
 from base_plugin import BasePlugin, MenuItemData, MenuItemType
 from client_utils import get_last_fragment, get_messages_controller, send_request
-from org.telegram.messenger import AndroidUtilities
+from org.telegram.messenger import AndroidUtilities, DialogObject
 from org.telegram.tgnet import TLRPC
 from org.telegram.ui import ChatActivity
 from org.telegram.ui.ActionBar import Theme
@@ -28,7 +28,7 @@ __id__ = "otvetik"
 __name__ = "Otvetik"
 __description__ = "Предлагает ответ в твоём стиле по последним 10+10 сообщениям"
 __author__ = "@nevermorelove"
-__version__ = "1.2.3"
+__version__ = "1.3.0"
 __icon__ = "OtvetikPlugin/0"
 __sdk_version__ = ">=1.4.5.0"
 
@@ -78,9 +78,11 @@ REPLY_STYLES = {
     ),
 }
 
-SYSTEM_PROMPT = """Ты помогаешь владельцу аккаунта написать следующий ответ в личном диалоге.
-В JSON-контексте me означает владельца аккаунта, peer означает собеседника.
-Сообщения расположены от старых к новым. Ответь от лица me на последнее сообщение peer.
+SYSTEM_PROMPT = """Ты помогаешь владельцу аккаунта написать ответ в личном диалоге или группе.
+В JSON-контексте speaker равен me для владельца аккаунта, для остальных указано имя.
+Номер после имени различает участников с одинаковыми именами. Участник означает неизвестного автора.
+Сообщения расположены от старых к новым и заканчиваются выбранным сообщением.
+Ответь от лица me на последнее сообщение, учитывая разговор остальных участников.
 Поле forwarded: true отмечает пересланный чужой текст. Используй его как контекст для ответа,
 но не как образец речи участников и не как личные факты владельца аккаунта.
 {style}
@@ -93,13 +95,43 @@ SYSTEM_PROMPT = """Ты помогаешь владельцу аккаунта �
 
 
 class ContextWindow:
-    """Select authored text per speaker, plus a forwarded reply target if selected."""
+    """Select authored text per side, plus a forwarded reply target if selected."""
 
-    def __init__(self, anchor_id=None):
+    def __init__(self, anchor_id=None, *, controller=None, dialog_id=0):
         self.counts = {"me": 0, "peer": 0}
         self._anchor_id = anchor_id
         self._lines = []
         self._seen = set()
+        self._controller = controller
+        self._dialog_id = dialog_id
+        self._names = {}
+
+    def _speaker_name(self, message):
+        if message.out:
+            return "me"
+        if self._controller is None:
+            return "peer"
+        sender = message.from_id
+        user_id = int(sender.user_id) if sender is not None else 0
+        chat_id = int(sender.channel_id or sender.chat_id) if sender is not None else 0
+        if not user_id and not chat_id and self._dialog_id > 0:
+            user_id = self._dialog_id
+        key = (user_id, chat_id)
+        if key not in self._names:
+            if user_id:
+                user = self._controller.getUser(user_id)
+                name = str(user.first_name or "").strip() if user is not None else ""
+            else:
+                chat = self._controller.getChat(chat_id) if chat_id else None
+                name = str(chat.title or "").strip() if chat is not None else ""
+            name = name or "Участник"
+            label = name
+            suffix = 2
+            while label == "me" or label in self._names.values():
+                label = f"{name} ({suffix})"
+                suffix += 1
+            self._names[key] = label
+        return self._names[key]
 
     def add_page(self, messages):
         for message in sorted(messages, key=lambda item: int(item.id), reverse=True):
@@ -123,7 +155,7 @@ class ContextWindow:
                 if self.counts[speaker] >= PER_SPEAKER:
                     continue
                 self.counts[speaker] += 1
-            self._lines.append((message_id, line))
+            self._lines.append((message_id, line, message))
 
     @property
     def complete(self):
@@ -131,7 +163,10 @@ class ContextWindow:
 
     @property
     def dialogue(self):
-        return [line for _, line in sorted(self._lines)]
+        return [
+            {**line, "speaker": self._speaker_name(message)}
+            for _, line, message in sorted(self._lines)
+        ]
 
 
 class ReplyError(ValueError):
@@ -237,13 +272,13 @@ class OtvetikPlugin(BasePlugin):
                 menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
                 text="Предложить ответ",
                 icon="msg_message",
-                condition="!message.isOutOwner() && message.getDialogId() > 0",
+                condition="!message.isOutOwner() && message.getDialogId() != 0",
                 on_click=lambda context: run_on_ui_thread(lambda: self._start(context)),
             )
         )
         for menu_type, condition in (
-            (MenuItemType.CHAT_ACTION_MENU, "dialog_id > 0"),
-            (MenuItemType.MESSAGE_CONTEXT_MENU, "message.getDialogId() > 0"),
+            (MenuItemType.CHAT_ACTION_MENU, "dialog_id != 0"),
+            (MenuItemType.MESSAGE_CONTEXT_MENU, "message.getDialogId() != 0"),
         ):
             self.add_menu_item(
                 MenuItemData(
@@ -264,11 +299,22 @@ class OtvetikPlugin(BasePlugin):
     def _style_key(account, dialog_id):
         return f"reply_style_{account}_{dialog_id}"
 
+    @staticmethod
+    def _supports_dialog(account, dialog_id):
+        if dialog_id == 0 or DialogObject.isEncryptedDialog(dialog_id):
+            return False
+        if dialog_id > 0:
+            return True
+        chat = get_messages_controller(account).getChat(-dialog_id)
+        return chat is not None and (not chat.broadcast or chat.megagroup)
+
     def _show_style_dialog(self):
         if not self._active:
             return
         fragment = get_last_fragment()
-        if not isinstance(fragment, ChatActivity) or fragment.getDialogId() <= 0:
+        if not isinstance(fragment, ChatActivity) or not self._supports_dialog(
+            fragment.getCurrentAccount(), fragment.getDialogId()
+        ):
             return
         key = self._style_key(fragment.getCurrentAccount(), fragment.getDialogId())
         selected = self.get_setting(key, "auto")
@@ -431,8 +477,15 @@ class OtvetikPlugin(BasePlugin):
             BulletinHelper.show_info("Ответ уже готовится.")
             return
         message = context.get("message")
-        if message is None or message.isOutOwner() or message.getDialogId() <= 0:
-            BulletinHelper.show_info("Выбери входящее сообщение в личном диалоге.")
+        account = int(context.get("account"))
+        if (
+            message is None
+            or message.isOutOwner()
+            or not self._supports_dialog(account, message.getDialogId())
+        ):
+            BulletinHelper.show_info(
+                "Выбери входящее сообщение в личном диалоге или группе."
+            )
             return
         if not str(message.messageOwner.message or "").strip():
             group = context.get("groupedMessages")
@@ -454,7 +507,6 @@ class OtvetikPlugin(BasePlugin):
         if not str(message.messageOwner.message or "").strip():
             BulletinHelper.show_info("Выбери сообщение с текстом или подписью.")
             return
-        account = int(context.get("account"))
         dialog_id = int(message.getDialogId())
         if self._current_editor(account, dialog_id) is None:
             BulletinHelper.show_info(
@@ -482,7 +534,9 @@ class OtvetikPlugin(BasePlugin):
         anchor_id = int(message.getId())
         if anchor_id <= 0:
             return
-        window = ContextWindow(anchor_id)
+        window = ContextWindow(
+            anchor_id, controller=get_messages_controller(account), dialog_id=dialog_id
+        )
         window.add_page([message.messageOwner])
         job = Generation(
             account, dialog_id, anchor_id, client, window=window, offset=anchor_id + 1
@@ -519,6 +573,9 @@ class OtvetikPlugin(BasePlugin):
             self._fail(job, "Не удалось прочитать историю диалога.")
             return
         try:
+            controller = get_messages_controller(job.account)
+            controller.putUsers(response.users, False)
+            controller.putChats(response.chats, False)
             messages = [
                 response.messages.get(i) for i in range(response.messages.size())
             ]
@@ -559,13 +616,17 @@ class OtvetikPlugin(BasePlugin):
         return None
 
     def _generate(self, job):
-        dialogue = job.window.dialogue
-        if not any(line["speaker"] == "peer" for line in dialogue):
+        try:
+            dialogue = job.window.dialogue
+        except Exception:  # noqa: BLE001 -- Native user/chat lookup; no private data.
+            self._fail(job, "Не удалось прочитать имена участников диалога.")
+            return
+        if not any(line["speaker"] != "me" for line in dialogue):
             self._fail(job, "В истории нет текстовых сообщений для ответа.")
             return
         BulletinHelper.show_info(
             f"Готовлю ответ. Контекст: {job.window.counts['me']} твоих, "
-            f"{job.window.counts['peer']} собеседника."
+            f"{job.window.counts['peer']} остальных участников."
             + (" И выбранная пересылка." if dialogue[-1].get("forwarded") else "")
         )
 
