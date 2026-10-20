@@ -2,10 +2,11 @@
 
 - `otvetik-mascot.png` содержит исходник с прозрачным фоном.
 - `otvetik-icon.webp` содержит версию 512×512 для Telegram-стикера, с сохранённой прозрачностью.
-- README использует PNG. Иконка в приложении ещё не подключена.
+- README использует PNG. Иконка в приложении подключена через `__icon__ = "OtvetikPlugin/0"`.
 
 SDK принимает `__icon__` в формате `StickerPackShortName/index`.
-Для подключения своей картинки нужен опубликованный Telegram-стикер.
+Картинка опубликована в [стикерпаке Otvetik](https://t.me/addstickers/OtvetikPlugin),
+которым владеет [@nevermorelove](https://t.me/nevermorelove).
 На проверенной сборке AyuGram индекс первого стикера равен нулю.
 
 Источник: [метаданные Plugins SDK](https://plugins.exteragram.app/docs/plugin-class).
