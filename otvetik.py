@@ -27,7 +27,7 @@ __id__ = "otvetik"
 __name__ = "Otvetik"
 __description__ = "Предлагает ответ в твоём стиле по последним 10+10 сообщениям"
 __author__ = "@nevermorelove"
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 __icon__ = "OtvetikPlugin/0"
 __sdk_version__ = ">=1.4.5.0"
 

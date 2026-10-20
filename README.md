@@ -1,6 +1,6 @@
 # Otvetik
 
-<img src="docs/otvetik-mascot.png" alt="Пёсик Otvetik с телефоном и пузырём ответа" width="240">
+<img src="docs/otvetik-mascot.png" alt="Попугай Otvetik с голубым пузырём ответа" width="240">
 
 Предлагает ответ в твоём стиле прямо в личном диалоге AyuGram или exteraGram.
 Берёт до 10 твоих и 10 сообщений собеседника, обращается к твоей модели и вставляет результат в поле ввода.
