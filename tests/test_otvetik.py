@@ -23,7 +23,7 @@ def load_plugin():
         "base_plugin": {
             "BasePlugin": type("BasePlugin", (), {}),
             "MenuItemData": lambda **kwargs: SimpleNamespace(**kwargs),
-            "MenuItemType": SimpleNamespace(MESSAGE_CONTEXT_MENU=1),
+            "MenuItemType": SimpleNamespace(MESSAGE_CONTEXT_MENU=1, CHAT_ACTION_MENU=2),
         },
         "client_utils": {
             "get_last_fragment": Mock(),
@@ -154,6 +154,15 @@ class ClientTests(unittest.TestCase):
                 )
                 self.assertEqual(client.generate(dialogue), "давай")
                 self.assertEqual(captured[-1][2]["reasoning_effort"], effort)
+            for style, (_, instruction) in plugin.REPLY_STYLES.items():
+                client = plugin.ChatClient(
+                    base + "/v1", "my-model", "test-key", reply_style=style
+                )
+                self.assertEqual(client.generate(dialogue), "давай")
+                system = captured[-1][2]["messages"][0]["content"]
+                self.assertIn(instruction, system)
+                self.assertIn("Не выдумывай личные факты", system)
+                self.assertNotIn("{style}", system)
             plugin.ChatClient(base + "/redirect", "model", "secret").generate(dialogue)
             self.assertEqual(captured[-1][0], "/destination")
             self.assertNotIn("Authorization", captured[-1][1])
@@ -180,12 +189,19 @@ class ClientTests(unittest.TestCase):
                     plugin.ChatClient(*settings)
             network.assert_not_called()
 
-    def test_invalid_effort_never_reaches_the_network(self):
+    def test_invalid_generation_options_never_reach_the_network(self):
         with patch.object(plugin, "urlopen") as network:
-            with self.assertRaises(plugin.ReplyError):
-                plugin.ChatClient(
-                    "https://example.com/v1", "model", "key", reasoning_effort="unknown"
-                )
+            for options in (
+                {"reasoning_effort": "unknown"},
+                {"reply_style": "unknown"},
+            ):
+                with (
+                    self.subTest(options=options),
+                    self.assertRaises(plugin.ReplyError),
+                ):
+                    plugin.ChatClient(
+                        "https://example.com/v1", "model", "key", **options
+                    )
             network.assert_not_called()
 
     def test_malformed_empty_and_oversized_responses_are_safe_errors(self):
@@ -211,6 +227,7 @@ class FlowTests(unittest.TestCase):
         self.instance = plugin.OtvetikPlugin()
         self.instance.add_menu_item = Mock()
         self.instance.get_setting = Mock(side_effect=lambda key, default="": default)
+        self.instance.set_setting = Mock()
         self.instance.on_plugin_load()
         self.job = plugin.Generation(1, 42, 500, Mock(), offset=501)
         self.instance._job = self.job
@@ -309,13 +326,14 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(settings[3].subtext, "Добавлен")
         self.assertNotIn("test-secret", str(settings))
 
-    def test_selected_effort_reaches_generation_client(self):
+    def test_selected_generation_options_reach_client(self):
         self.instance._job = None
         settings = {
             "base_url": "https://example.com/v1",
             "model": "model",
             "api_key": "test-key",
             "reasoning_effort": plugin.REASONING_EFFORTS.index("high"),
+            self.instance._style_key(1, 42): "strict",
         }
         self.instance.get_setting.side_effect = lambda key, default="": settings.get(
             key, default
@@ -331,7 +349,36 @@ class FlowTests(unittest.TestCase):
             SimpleNamespace(get={"account": 1, "message": incoming}.get)
         )
         self.assertEqual(self.instance._job.client.reasoning_effort, "high")
+        self.assertEqual(self.instance._job.client.reply_style, "strict")
         self.instance._load_history.assert_called_once_with(self.instance._job)
+
+    def test_style_selection_is_saved_for_the_original_chat_and_account(self):
+        saved = {}
+        self.instance.get_setting.side_effect = lambda key, default="": saved.get(
+            key, default
+        )
+        self.instance.set_setting.side_effect = saved.__setitem__
+        self.instance._show_style_dialog()
+        dialog = plugin.AlertDialogBuilder.return_value
+        labels, select = dialog.set_items.call_args.args
+        self.assertEqual(labels[0], "✓ Как я")
+        self.fragment.getDialogId = lambda: 43
+        select(dialog, 1)
+        self.assertEqual(saved[self.instance._style_key(1, 42)], "meme")
+        self.assertEqual(saved.get(self.instance._style_key(1, 43), "auto"), "auto")
+        self.assertEqual(saved.get(self.instance._style_key(2, 42), "auto"), "auto")
+        self.fragment.getDialogId = lambda: 42
+        self.instance._show_style_dialog()
+        self.assertEqual(dialog.set_items.call_args.args[0][1], "✓ Мемный")
+
+    def test_cancelled_style_picker_and_unload_do_not_write_settings(self):
+        self.instance._show_style_dialog()
+        dialog = plugin.AlertDialogBuilder.return_value
+        select = dialog.set_items.call_args.args[1]
+        self.instance.set_setting.assert_not_called()
+        self.instance.on_plugin_unload()
+        select(dialog, 1)
+        self.instance.set_setting.assert_not_called()
 
     def test_unexpected_transport_error_does_not_reveal_credentials(self):
         self.job.window.add_page([message(500)])

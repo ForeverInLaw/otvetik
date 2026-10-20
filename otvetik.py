@@ -27,7 +27,7 @@ __id__ = "otvetik"
 __name__ = "Otvetik"
 __description__ = "Предлагает ответ в твоём стиле по последним 10+10 сообщениям"
 __author__ = "@nevermorelove"
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __icon__ = "OtvetikPlugin/0"
 __sdk_version__ = ">=1.4.5.0"
 
@@ -36,12 +36,50 @@ PAGE_SIZE = 100
 MAX_PAGES = 10
 MAX_RESPONSE_BYTES = 1024 * 1024
 REASONING_EFFORTS = ("", "none", "minimal", "low", "medium", "high", "xhigh", "max")
+REPLY_STYLES = {
+    "auto": (
+        "Как я",
+        (
+            "Ориентируйся на стиль me: длину фраз, регистр, обращения, лексику, пунктуацию и эмодзи.\n"
+            "Если me пишет неформально, отвечай так же."
+        ),
+    ),
+    "meme": (
+        "Мемный",
+        (
+            "Отвечай в мемном стиле: разговорно, с уместной иронией и короткими шутками. "
+            "Подстраивай юмор под контекст, без натянутых мемов и потока эмодзи. "
+            "Учитывай привычную лексику me."
+        ),
+    ),
+    "strict": (
+        "Строгий",
+        (
+            "Отвечай строго и по делу: сдержанно, ясно, без шуток, сленга и эмодзи. "
+            "Сохраняй уважительный тон, без грубости и канцелярита."
+        ),
+    ),
+    "friendly": (
+        "Дружелюбный",
+        (
+            "Отвечай дружелюбно и тепло, простыми живыми фразами. "
+            "Без излишней фамильярности, лести и навязчивых эмодзи. Учитывай лексику me."
+        ),
+    ),
+    "short": (
+        "Короткий",
+        (
+            "Отвечай кратко: одна-две короткие фразы, только суть. "
+            "Сохраняй манеру речи me, без вступлений и повторов."
+        ),
+    ),
+}
 
 SYSTEM_PROMPT = """Ты помогаешь владельцу аккаунта написать следующий ответ в личном диалоге.
 В JSON-контексте me означает владельца аккаунта, peer означает собеседника.
 Сообщения расположены от старых к новым. Ответь от лица me на последнее сообщение peer.
-Ориентируйся на стиль me: длину фраз, регистр, обращения, лексику, пунктуацию и эмодзи.
-Если me пишет неформально, отвечай так же. Используй язык этого диалога.
+{style}
+Используй язык этого диалога.
 Предложи один естественный ответ. Не выдумывай личные факты, действия и обещания владельца.
 Если для ответа не хватает фактов, предложи короткий уточняющий вопрос собеседнику.
 Не добавляй вступлений, пояснений, кавычек вокруг ответа и длинных тире.
@@ -91,12 +129,17 @@ class ReplyError(ValueError):
 class ChatClient:
     """Small OpenAI-compatible Chat Completions boundary, with no SDK dependency."""
 
-    def __init__(self, base_url, model, api_key, *, reasoning_effort=""):
+    def __init__(
+        self, base_url, model, api_key, *, reasoning_effort="", reply_style="auto"
+    ):
         self.model = model.strip()
         self._api_key = api_key.strip()
         if reasoning_effort not in REASONING_EFFORTS:
             raise ReplyError("Выбери Reasoning effort в настройках Otvetik.")
         self.reasoning_effort = reasoning_effort
+        if reply_style not in REPLY_STYLES:
+            raise ReplyError("Выбери стиль ответа в меню чата.")
+        self.reply_style = reply_style
         if not base_url.strip() or not self.model or not self._api_key:
             raise ReplyError(
                 "Заполни Base URL, модель и API-ключ в настройках Otvetik."
@@ -122,7 +165,12 @@ class ChatClient:
             "model": self.model,
             "stream": False,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT.format(
+                        style=REPLY_STYLES[self.reply_style][1]
+                    ),
+                },
                 {
                     "role": "user",
                     "content": json.dumps({"dialogue": dialogue}, ensure_ascii=False),
@@ -181,10 +229,56 @@ class OtvetikPlugin(BasePlugin):
                 on_click=lambda context: run_on_ui_thread(lambda: self._start(context)),
             )
         )
+        for menu_type, condition in (
+            (MenuItemType.CHAT_ACTION_MENU, "dialog_id > 0"),
+            (MenuItemType.MESSAGE_CONTEXT_MENU, "message.getDialogId() > 0"),
+        ):
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=menu_type,
+                    text="Стиль ответа",
+                    subtext="Для этого чата",
+                    icon="msg_edit",
+                    condition=condition,
+                    on_click=lambda context: run_on_ui_thread(self._show_style_dialog),
+                )
+            )
 
     def on_plugin_unload(self):
         self._active = False
         self._job = None
+
+    @staticmethod
+    def _style_key(account, dialog_id):
+        return f"reply_style_{account}_{dialog_id}"
+
+    def _show_style_dialog(self):
+        if not self._active:
+            return
+        fragment = get_last_fragment()
+        if not isinstance(fragment, ChatActivity) or fragment.getDialogId() <= 0:
+            return
+        key = self._style_key(fragment.getCurrentAccount(), fragment.getDialogId())
+        selected = self.get_setting(key, "auto")
+        styles = list(REPLY_STYLES)
+        labels = [
+            ("✓ " if code == selected else "") + REPLY_STYLES[code][0]
+            for code in styles
+        ]
+
+        def select(dialog, index):
+            dialog.dismiss()
+            if self._active and 0 <= index < len(styles):
+                self.set_setting(key, styles[index])
+                BulletinHelper.show_success(
+                    "Стиль ответа: " + REPLY_STYLES[styles[index]][0]
+                )
+
+        dialog = AlertDialogBuilder(fragment.getParentActivity())
+        dialog.set_title("Стиль ответа")
+        dialog.set_items(labels, select)
+        dialog.set_negative_button("Отмена")
+        dialog.show()
 
     def create_settings(self):
         base_url = str(self.get_setting("base_url", ""))
@@ -352,6 +446,9 @@ class OtvetikPlugin(BasePlugin):
                 str(self.get_setting("model", "")),
                 str(self.get_setting("api_key", "")),
                 reasoning_effort=REASONING_EFFORTS[effort_index],
+                reply_style=self.get_setting(
+                    self._style_key(account, dialog_id), "auto"
+                ),
             )
         except ReplyError as error:
             BulletinHelper.show_error(str(error))
