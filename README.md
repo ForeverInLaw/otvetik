@@ -1,16 +1,22 @@
-# Otvetik
-
-<img src="docs/otvetik-mascot.png" alt="Попугай Otvetik с голубым пузырём ответа" width="240">
+<div align="center">
+  <img src="docs/otvetik-mascot.png" alt="Попугай Otvetik с голубым пузырём ответа" width="180">
+  <h1>Otvetik</h1>
+  <p>Ответ в твоём стиле</p>
+  <p>
+    <a href="https://github.com/ForeverInLaw/otvetik/releases/latest/download/otvetik.plugin"><strong>Скачать плагин</strong></a>
+    · <a href="#настройка">Настройка</a>
+    · <a href="https://t.me/addstickers/OtvetikPlugin">Стикерпак</a>
+  </p>
+  <a href="https://github.com/ForeverInLaw/otvetik/actions/workflows/ci.yml"><img src="https://github.com/ForeverInLaw/otvetik/actions/workflows/ci.yml/badge.svg" alt="CI and release"></a>
+</div>
 
 Предлагает ответ в твоём стиле прямо в личном диалоге AyuGram или exteraGram.
 Берёт до 10 твоих и 10 сообщений собеседника, обращается к твоей модели и вставляет результат в поле ввода.
 Отправляешь сообщение ты.
 
-Иконка плагина: [стикерпак Otvetik](https://t.me/addstickers/OtvetikPlugin).
-
 ## Установка
 
-1. Скачай `otvetik.plugin` на телефон.
+1. [Скачай `otvetik.plugin`](https://github.com/ForeverInLaw/otvetik/releases/latest/download/otvetik.plugin) на телефон.
 2. В настройках плагинов разреши установку из неизвестных источников.
 3. Открой файл через AyuGram или exteraGram и включи плагин.
 
@@ -76,6 +82,10 @@ Copy-Item otvetik.py dist/otvetik.plugin
 
 Тесты проверяют отбор контекста, реальный HTTP-запрос к локальному серверу, обработку ошибок и защиту черновика.
 Android API в тестах заменён заглушками. Для проверки своего провайдера введи настройки на телефоне.
+
+GitHub Actions запускает проверки для `main`, pull request и тегов `v*`.
+После успешной проверки тега публикует GitHub Release с файлом `otvetik.plugin`.
+Тег должен совпадать с `__version__` в `otvetik.py`, например `v1.0.2`.
 
 Документация: [Plugins SDK](https://plugins.exteragram.app/docs), [Telegram messages.getHistory](https://core.telegram.org/method/messages.getHistory).
 
